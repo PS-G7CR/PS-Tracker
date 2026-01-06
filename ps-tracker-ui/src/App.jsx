@@ -30,11 +30,6 @@ const ACTIVITY_TYPES = [
 const API = import.meta.env.VITE_API_BASE || "";
 //"http://localhost:4000" - to run locally
 
-
-<div style={{ fontSize: "12px", opacity: 0.7 }}>
-  Deployed via GitHub Actions
-</div>
-
 /* ================== Utils ================== */
 
 const cx = (...xs) => xs.filter(Boolean).join(" ");
@@ -233,7 +228,7 @@ export default function App() {
                 <h1 className="text-2xl font-semibold tracking-tight">
                   Presales <AzureA onClick={() => { setAzureKey(k => k + 1); setShowAzure(true); }} />ctivity Tracker
                 </h1>
-              <p className="text-sm text-slate-500">Capture activities and review weekly KPIs.</p>
+              <p className="text-sm text-slate-500">Capture activities and review weekly KPIs. - github</p>
             </div>
             <div className="flex gap-2">
               <TabButton active={tab === "tracker"} onClick={() => switchTab("tracker")}>Tracker</TabButton>
