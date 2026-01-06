@@ -30,6 +30,11 @@ const ACTIVITY_TYPES = [
 const API = import.meta.env.VITE_API_BASE || "";
 //"http://localhost:4000" - to run locally
 
+
+<div style={{ fontSize: "12px", opacity: 0.7 }}>
+  Deployed via GitHub Actions
+</div>
+
 /* ================== Utils ================== */
 
 const cx = (...xs) => xs.filter(Boolean).join(" ");
