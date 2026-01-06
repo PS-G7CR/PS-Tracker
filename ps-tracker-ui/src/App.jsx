@@ -228,7 +228,7 @@ export default function App() {
                 <h1 className="text-2xl font-semibold tracking-tight">
                   Presales <AzureA onClick={() => { setAzureKey(k => k + 1); setShowAzure(true); }} />ctivity Tracker
                 </h1>
-              <p className="text-sm text-slate-500">Capture activities and review weekly KPIs. - github</p>
+              <p className="text-sm text-slate-500">Capture activities and review weekly KPIs.</p>
             </div>
             <div className="flex gap-2">
               <TabButton active={tab === "tracker"} onClick={() => switchTab("tracker")}>Tracker</TabButton>
