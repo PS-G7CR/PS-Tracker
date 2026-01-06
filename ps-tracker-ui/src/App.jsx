@@ -2458,7 +2458,7 @@ function QuotesOverlay({ onClose }) {
       </div>
 
       <div className="spirit-footer">
-        Developed by Abhishek Tarafdar with ❤️, for Presales.
+        Developed by Abhishek Tarafdar with ❤️, for Presales(2026-2027). 
       </div>
     </div>
   );
