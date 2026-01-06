@@ -1,0 +1,52 @@
+name: Deploy PreTracker to Azure App Service
+
+on:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Build UI
+      - name: Install UI dependencies
+        working-directory: ps-tracker-ui
+        run: npm ci
+
+      - name: Build UI (production)
+        working-directory: ps-tracker-ui
+        env:
+          VITE_API_BASE: ""
+        run: npm run build
+
+      # Stage UI build into backend (api/static)
+      - name: Stage UI into API static folder
+        run: |
+          rm -rf api/static
+          mkdir -p api/static
+          cp -R ps-tracker-ui/dist/* api/static/
+
+      # Install API dependencies
+      - name: Install API dependencies
+        working-directory: api
+        run: npm ci
+
+      # Deploy to Azure App Service
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: PS-Tracker
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE_PS_TRACKER }}
+          package: api
