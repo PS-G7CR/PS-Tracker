@@ -399,6 +399,493 @@ app.get("/api/azure-facts", async (req, res) => {
   }
 });
 
+/* -------- Tickets -------- */
+
+// GET tickets (grouped by ticket_id from activities)
+app.get("/api/tickets", async (req, res) => {
+  try {
+    const { q = "", owner = "", status = "" } = req.query;
+    const params = [];
+    const conds = [];
+
+    if (q) {
+      const v = `%${String(q).toLowerCase()}%`;
+      params.push(v, v, v);
+      conds.push(`(lower(a.ticket_id) LIKE $${params.length - 2} OR lower(a.customer_name) LIKE $${params.length - 1} OR lower(a.customer_id) LIKE $${params.length})`);
+    }
+    if (owner) {
+      params.push(String(owner).toLowerCase());
+      conds.push(`lower(a.owner) = $${params.length}`);
+    }
+    if (status) {
+      params.push(String(status));
+      conds.push(`t.status = $${params.length}`);
+    }
+
+    const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+
+    const sql = `
+      SELECT
+        a.ticket_id,
+        MAX(a.customer_name) AS customer_name,
+        MAX(a.customer_id) AS customer_id,
+        MAX(a.owner) AS owner,
+        MAX(a.sales_owner) AS sales_owner,
+        array_agg(DISTINCT x ORDER BY x) AS activity_types,
+        COUNT(a.id)::int AS total_activities,
+        SUM(a.hours)::numeric AS total_hours,
+        MIN(a.assigned_date) AS assigned_date,
+        MAX(a.activity_date) AS latest_activity_date,
+        COALESCE(t.status, 'Open') AS status,
+        tkr.proposal_quality,
+        tkr.solution_accuracy,
+        tkr.average_tat,
+        tkr.stakeholder_satisfaction
+      FROM activity a
+      CROSS JOIN LATERAL unnest(a.activity_types) AS x
+      LEFT JOIN ticket t ON t.ticket_id = a.ticket_id
+      LEFT JOIN ticket_kpi_rating tkr ON tkr.ticket_id = a.ticket_id
+      ${where}
+      GROUP BY a.ticket_id, t.status, tkr.proposal_quality, tkr.solution_accuracy, tkr.average_tat, tkr.stakeholder_satisfaction
+      ORDER BY MAX(a.activity_date) DESC
+      LIMIT 5000;
+    `;
+
+    const r = await pool.query(sql, params);
+    res.json({ items: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// PUT ticket status
+app.put("/api/tickets/:ticketId/status", async (req, res) => {
+  try {
+    const { ticketId } = req.params;
+    const { status } = req.body || {};
+    if (!status || !["Open", "Closed"].includes(status)) {
+      return res.status(400).json({ error: "Status must be Open or Closed" });
+    }
+    const sql = `
+      INSERT INTO ticket (ticket_id, status, updated_at)
+      VALUES ($1, $2, now())
+      ON CONFLICT (ticket_id)
+      DO UPDATE SET status = EXCLUDED.status, updated_at = now()
+      RETURNING *;
+    `;
+    const r = await pool.query(sql, [ticketId, status]);
+    res.json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// GET activities for a specific ticket
+app.get("/api/tickets/:ticketId/activities", async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT id, customer_name, customer_id, ticket_id, description, activity_types,
+              owner, sales_owner, hours, assigned_date, activity_date, created_at
+       FROM activity WHERE ticket_id = $1
+       ORDER BY activity_date DESC, created_at DESC`,
+      [req.params.ticketId]
+    );
+    res.json({ items: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+/* -------- Ticket KPI Ratings -------- */
+
+// PUT ticket KPI rating
+app.put("/api/tickets/:ticketId/kpi", async (req, res) => {
+  try {
+    const { ticketId } = req.params;
+    const b = req.body || {};
+
+    // Ensure ticket exists
+    await pool.query(
+      `INSERT INTO ticket (ticket_id, status) VALUES ($1, 'Open') ON CONFLICT (ticket_id) DO NOTHING`,
+      [ticketId]
+    );
+
+    const sql = `
+      INSERT INTO ticket_kpi_rating (ticket_id, proposal_quality, solution_accuracy, average_tat, stakeholder_satisfaction, updated_at)
+      VALUES ($1, $2, $3, $4, $5, now())
+      ON CONFLICT (ticket_id)
+      DO UPDATE SET
+        proposal_quality = EXCLUDED.proposal_quality,
+        solution_accuracy = EXCLUDED.solution_accuracy,
+        average_tat = EXCLUDED.average_tat,
+        stakeholder_satisfaction = EXCLUDED.stakeholder_satisfaction,
+        updated_at = now()
+      RETURNING *;
+    `;
+    const r = await pool.query(sql, [
+      ticketId,
+      b.proposal_quality ?? null,
+      b.solution_accuracy ?? null,
+      b.average_tat ?? null,
+      b.stakeholder_satisfaction ?? null,
+    ]);
+    res.json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+/* -------- Monthly KPI (computed from ticket ratings) -------- */
+
+app.get("/api/kpi/monthly", async (req, res) => {
+  try {
+    const { month, year } = req.query;
+    if (!month || !year) return res.status(400).json({ error: "month and year required" });
+
+    const m = parseInt(month);
+    const y = parseInt(year);
+    const startDate = `${y}-${String(m).padStart(2, "0")}-01`;
+    const endDate = m === 12 ? `${y + 1}-01-01` : `${y}-${String(m + 1).padStart(2, "0")}-01`;
+
+    const sql = `
+      SELECT
+        a.owner,
+        AVG(tkr.proposal_quality) AS avg_proposal_quality,
+        AVG(tkr.solution_accuracy) AS avg_solution_accuracy,
+        AVG(tkr.average_tat) AS avg_average_tat,
+        AVG(tkr.stakeholder_satisfaction) AS avg_stakeholder_satisfaction,
+        COUNT(DISTINCT a.ticket_id)::int AS rated_tickets
+      FROM activity a
+      JOIN ticket_kpi_rating tkr ON tkr.ticket_id = a.ticket_id
+      WHERE a.activity_date >= $1::date AND a.activity_date < $2::date
+      GROUP BY a.owner
+      ORDER BY a.owner;
+    `;
+    const r = await pool.query(sql, [startDate, endDate]);
+    const rows = r.rows.map(x => ({
+      owner: x.owner,
+      avgProposalQuality: x.avg_proposal_quality ? Number(x.avg_proposal_quality) : null,
+      avgSolutionAccuracy: x.avg_solution_accuracy ? Number(x.avg_solution_accuracy) : null,
+      avgAverageTat: x.avg_average_tat ? Number(x.avg_average_tat) : null,
+      avgStakeholderSatisfaction: x.avg_stakeholder_satisfaction ? Number(x.avg_stakeholder_satisfaction) : null,
+      ratedTickets: x.rated_tickets,
+      monthlyWeightedScore: x.avg_proposal_quality && x.avg_solution_accuracy && x.avg_average_tat && x.avg_stakeholder_satisfaction
+        ? Number(x.avg_proposal_quality) * 20 + Number(x.avg_solution_accuracy) * 20 + Number(x.avg_average_tat) * 15 + Number(x.avg_stakeholder_satisfaction) * 10
+        : null,
+      monthlyKpiRating: x.avg_proposal_quality && x.avg_solution_accuracy && x.avg_average_tat && x.avg_stakeholder_satisfaction
+        ? (Number(x.avg_proposal_quality) * 20 + Number(x.avg_solution_accuracy) * 20 + Number(x.avg_average_tat) * 15 + Number(x.avg_stakeholder_satisfaction) * 10) / 65
+        : null,
+    }));
+    res.json({ month: m, year: y, rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+/* -------- Quarterly KPI -------- */
+
+// GET quarterly KPI
+app.get("/api/kpi/quarterly", async (req, res) => {
+  try {
+    const { fy, quarter } = req.query;
+    if (!fy || !quarter) return res.status(400).json({ error: "fy and quarter required" });
+
+    const sql = `
+      SELECT owner, owner_norm, financial_year, quarter,
+             professional_behaviour, upskilling_certifications, updated_at
+      FROM quarterly_kpi
+      WHERE financial_year = $1 AND quarter = $2
+      ORDER BY owner;
+    `;
+    const r = await pool.query(sql, [fy, quarter]);
+    const rows = r.rows.map(x => ({
+      owner: x.owner,
+      financialYear: x.financial_year,
+      quarter: x.quarter,
+      professionalBehaviour: x.professional_behaviour ? Number(x.professional_behaviour) : null,
+      upskillingCertifications: x.upskilling_certifications ? Number(x.upskilling_certifications) : null,
+      updatedAt: x.updated_at,
+      quarterlyWeightedScore: x.professional_behaviour && x.upskilling_certifications
+        ? Number(x.professional_behaviour) * 20 + Number(x.upskilling_certifications) * 15
+        : null,
+      quarterlyKpiRating: x.professional_behaviour && x.upskilling_certifications
+        ? (Number(x.professional_behaviour) * 20 + Number(x.upskilling_certifications) * 15) / 35
+        : null,
+    }));
+    res.json({ fy, quarter, rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// PUT quarterly KPI
+app.put("/api/kpi/quarterly", async (req, res) => {
+  try {
+    const { owner, financialYear, quarter, professionalBehaviour, upskillingCertifications } = req.body || {};
+    if (!owner || !financialYear || !quarter) {
+      return res.status(400).json({ error: "owner, financialYear, and quarter required" });
+    }
+
+    const sql = `
+      INSERT INTO quarterly_kpi (owner, financial_year, quarter, professional_behaviour, upskilling_certifications, updated_at)
+      VALUES ($1, $2, $3, $4, $5, now())
+      ON CONFLICT (owner_norm, financial_year, quarter)
+      DO UPDATE SET
+        professional_behaviour = EXCLUDED.professional_behaviour,
+        upskilling_certifications = EXCLUDED.upskilling_certifications,
+        updated_at = now()
+      RETURNING *;
+    `;
+    const r = await pool.query(sql, [owner, financialYear, quarter, professionalBehaviour ?? null, upskillingCertifications ?? null]);
+    res.json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+/* -------- Learning -------- */
+
+// GET learning entries
+app.get("/api/learning", async (req, res) => {
+  try {
+    const { q = "", owner = "", category = "", status = "" } = req.query;
+    const params = [];
+    const conds = [];
+
+    if (q) {
+      const v = `%${String(q).toLowerCase()}%`;
+      params.push(v, v, v);
+      conds.push(`(lower(topic) LIKE $${params.length - 2} OR lower(description) LIKE $${params.length - 1} OR lower(category) LIKE $${params.length})`);
+    }
+    if (owner) {
+      params.push(String(owner).toLowerCase());
+      conds.push(`lower(owner) = $${params.length}`);
+    }
+    if (category) {
+      params.push(String(category).toLowerCase());
+      conds.push(`lower(category) = $${params.length}`);
+    }
+    if (status) {
+      params.push(String(status));
+      conds.push(`status = $${params.length}`);
+    }
+
+    const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+
+    const sql = `
+      SELECT id, owner, date, topic, category, description, hours, status, source_link, completion_date, created_at
+      FROM learning
+      ${where}
+      ORDER BY date DESC, created_at DESC
+      LIMIT 5000;
+    `;
+    const r = await pool.query(sql, params);
+    res.json({ items: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// POST learning entry
+app.post("/api/learning", async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!b.owner || !b.topic || !b.date) return res.status(400).json({ error: "owner, topic, and date required" });
+
+    const sql = `
+      INSERT INTO learning (owner, date, topic, category, description, hours, status, source_link, completion_date)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING *;
+    `;
+    const r = await pool.query(sql, [
+      b.owner, b.date, b.topic, b.category || "", b.description || "",
+      Number(b.hours || 0), b.status || "In Progress", b.source_link || "", b.completion_date || null
+    ]);
+    res.status(201).json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// PUT learning entry
+app.put("/api/learning/:id", async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (!b.owner || !b.topic || !b.date) return res.status(400).json({ error: "owner, topic, and date required" });
+
+    const sql = `
+      UPDATE learning SET
+        owner = $1, date = $2, topic = $3, category = $4, description = $5,
+        hours = $6, status = $7, source_link = $8, completion_date = $9
+      WHERE id = $10
+      RETURNING *;
+    `;
+    const r = await pool.query(sql, [
+      b.owner, b.date, b.topic, b.category || "", b.description || "",
+      Number(b.hours || 0), b.status || "In Progress", b.source_link || "", b.completion_date || null,
+      req.params.id
+    ]);
+    if (r.rowCount === 0) return res.status(404).json({ error: "Not found" });
+    res.json(r.rows[0]);
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// DELETE learning entry
+app.delete("/api/learning/:id", async (req, res) => {
+  try {
+    const r = await pool.query("DELETE FROM learning WHERE id = $1", [req.params.id]);
+    if (r.rowCount === 0) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+/* -------- Dashboard Summary -------- */
+
+app.get("/api/dashboard", async (req, res) => {
+  try {
+    const { month, year } = req.query;
+    if (!month || !year) return res.status(400).json({ error: "month and year required" });
+
+    const m = parseInt(month);
+    const y = parseInt(year);
+    const startDate = `${y}-${String(m).padStart(2, "0")}-01`;
+    const endDate = m === 12 ? `${y + 1}-01-01` : `${y}-${String(m + 1).padStart(2, "0")}-01`;
+
+    // Determine financial year and quarter
+    const fyStart = m >= 4 ? y : y - 1;
+    const fy = `FY${fyStart}-${String(fyStart + 1).slice(2)}`;
+    let quarter;
+    if (m >= 4 && m <= 6) quarter = "Q1";
+    else if (m >= 7 && m <= 9) quarter = "Q2";
+    else if (m >= 10 && m <= 12) quarter = "Q3";
+    else quarter = "Q4";
+
+    // Monthly KPI from ticket ratings
+    const mkpi = await pool.query(`
+      SELECT
+        a.owner,
+        AVG(tkr.proposal_quality) AS avg_pq,
+        AVG(tkr.solution_accuracy) AS avg_sa,
+        AVG(tkr.average_tat) AS avg_tat,
+        AVG(tkr.stakeholder_satisfaction) AS avg_ss,
+        COUNT(DISTINCT a.ticket_id)::int AS rated_tickets
+      FROM activity a
+      JOIN ticket_kpi_rating tkr ON tkr.ticket_id = a.ticket_id
+      WHERE a.activity_date >= $1::date AND a.activity_date < $2::date
+      GROUP BY a.owner
+    `, [startDate, endDate]);
+
+    // Quarterly KPI
+    const qkpi = await pool.query(`
+      SELECT owner, professional_behaviour, upskilling_certifications
+      FROM quarterly_kpi
+      WHERE financial_year = $1 AND quarter = $2
+    `, [fy, quarter]);
+
+    // Total hours per owner
+    const hours = await pool.query(`
+      SELECT owner, SUM(hours)::numeric AS total_hours
+      FROM activity
+      WHERE activity_date >= $1::date AND activity_date < $2::date
+      GROUP BY owner
+    `, [startDate, endDate]);
+
+    // Ticket summary per owner
+    const tickets = await pool.query(`
+      SELECT
+        a.owner,
+        COUNT(DISTINCT a.ticket_id)::int AS total_tickets,
+        COUNT(DISTINCT CASE WHEN t.status = 'Open' THEN a.ticket_id END)::int AS open_tickets,
+        COUNT(DISTINCT CASE WHEN t.status = 'Closed' OR t.status IS NULL THEN a.ticket_id END)::int AS closed_tickets
+      FROM activity a
+      LEFT JOIN ticket t ON t.ticket_id = a.ticket_id
+      WHERE a.activity_date >= $1::date AND a.activity_date < $2::date
+      GROUP BY a.owner
+    `, [startDate, endDate]);
+
+    // Learning summary per owner
+    const learning = await pool.query(`
+      SELECT owner, COUNT(*)::int AS total_entries, SUM(hours)::numeric AS total_learning_hours
+      FROM learning
+      WHERE date >= $1::date AND date < $2::date
+      GROUP BY owner
+    `, [startDate, endDate]);
+
+    // Combine all by owner
+    const ownerSet = new Set();
+    mkpi.rows.forEach(r => ownerSet.add(r.owner));
+    qkpi.rows.forEach(r => ownerSet.add(r.owner));
+    hours.rows.forEach(r => ownerSet.add(r.owner));
+    tickets.rows.forEach(r => ownerSet.add(r.owner));
+    learning.rows.forEach(r => ownerSet.add(r.owner));
+
+    const mkpiMap = Object.fromEntries(mkpi.rows.map(r => [r.owner, r]));
+    const qkpiMap = Object.fromEntries(qkpi.rows.map(r => [r.owner, r]));
+    const hoursMap = Object.fromEntries(hours.rows.map(r => [r.owner, r]));
+    const ticketsMap = Object.fromEntries(tickets.rows.map(r => [r.owner, r]));
+    const learningMap = Object.fromEntries(learning.rows.map(r => [r.owner, r]));
+
+    const rows = [...ownerSet].sort().map(owner => {
+      const mk = mkpiMap[owner] || {};
+      const qk = qkpiMap[owner] || {};
+      const h = hoursMap[owner] || {};
+      const t = ticketsMap[owner] || {};
+      const l = learningMap[owner] || {};
+
+      const avgPQ = mk.avg_pq ? Number(mk.avg_pq) : null;
+      const avgSA = mk.avg_sa ? Number(mk.avg_sa) : null;
+      const avgTAT = mk.avg_tat ? Number(mk.avg_tat) : null;
+      const avgSS = mk.avg_ss ? Number(mk.avg_ss) : null;
+
+      const monthlyWeighted = (avgPQ && avgSA && avgTAT && avgSS)
+        ? avgPQ * 20 + avgSA * 20 + avgTAT * 15 + avgSS * 10 : null;
+      const monthlyKpiRating = monthlyWeighted ? monthlyWeighted / 65 : null;
+
+      const pb = qk.professional_behaviour ? Number(qk.professional_behaviour) : null;
+      const uc = qk.upskilling_certifications ? Number(qk.upskilling_certifications) : null;
+      const quarterlyWeighted = (pb && uc) ? pb * 20 + uc * 15 : null;
+      const quarterlyKpiRating = quarterlyWeighted ? quarterlyWeighted / 35 : null;
+
+      return {
+        owner,
+        monthlyKpi: {
+          avgProposalQuality: avgPQ,
+          avgSolutionAccuracy: avgSA,
+          avgAverageTat: avgTAT,
+          avgStakeholderSatisfaction: avgSS,
+          ratedTickets: mk.rated_tickets || 0,
+          monthlyWeightedScore: monthlyWeighted,
+          monthlyKpiRating,
+        },
+        quarterlyKpi: {
+          professionalBehaviour: pb,
+          upskillingCertifications: uc,
+          quarterlyWeightedScore: quarterlyWeighted,
+          quarterlyKpiRating,
+        },
+        tickets: {
+          total: t.total_tickets || 0,
+          open: t.open_tickets || 0,
+          closed: t.closed_tickets || 0,
+        },
+        learning: {
+          totalEntries: l.total_entries || 0,
+          totalHours: l.total_learning_hours ? Number(l.total_learning_hours) : 0,
+        },
+        totalHours: h.total_hours ? Number(h.total_hours) : 0,
+      };
+    });
+
+    res.json({ month: m, year: y, fy, quarter, rows });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 /* -------- Start -------- */
 const port = process.env.PORT || 4000;
 
@@ -431,19 +918,6 @@ app.post("/api/owners", async (req, res) => {
     res.status(500).json({ error: String(e) });
   }
 });
-// ---- Serve React build (placed under ./static) ----
-const STATIC_DIR = path.join(__dirname, "static");
-app.use(express.static(STATIC_DIR));
-
-app.get(/^\/(?!api\/).*/, (_req, res) => {
-  res.sendFile(path.join(staticDir, "index.html"));
-});
-
-// SPA fallback: send index.html for non-API routes
-// app.get("*", (req, res, next) => {
-//   if (req.path.startsWith("/api/")) return next();
-//   res.sendFile(path.join(STATIC_DIR, "index.html"));
-// });
 
   app.listen(port, () => console.log(`API on http://localhost:${port}`));
 }
